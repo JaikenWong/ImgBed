@@ -57,7 +57,7 @@ async function loadConfig(): Promise<void> {
   for (const key of CONFIG_KEYS) {
     try {
       const val = await invoke<string | null>("get_config", { key });
-      if (val) (currentConfig as Record<string, string>)[key] = val;
+      if (val) currentConfig[key] = val;
     } catch { /* keep default */ }
   }
 
@@ -93,7 +93,7 @@ async function saveAllConfig(): Promise<void> {
   try {
     if (cfg.token) await invoke("set_config", { key: "github_token", value: cfg.token });
     for (const key of CONFIG_KEYS) {
-      await invoke("set_config", { key, value: (cfg as Record<string, string>)[key] });
+      await invoke("set_config", { key, value: cfg[key] });
     }
     currentConfig = cfg;
     ($("input#tokenInput") as HTMLInputElement).value = maskToken(cfg.token);
@@ -126,7 +126,7 @@ async function testConnection(): Promise<void> {
       currentConfig = cfg;
       await invoke("set_config", { key: "github_token", value: cfg.token });
       for (const key of CONFIG_KEYS) {
-        await invoke("set_config", { key, value: (cfg as Record<string, string>)[key] });
+        await invoke("set_config", { key, value: cfg[key] });
       }
       ($("input#tokenInput") as HTMLInputElement).value = maskToken(cfg.token);
       updateTokenStatus("configured", `✓ ${data.login}`);
