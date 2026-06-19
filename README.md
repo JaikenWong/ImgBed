@@ -16,9 +16,13 @@ macOS 剪贴板图床工具，基于 Tauri v2 + Rust + TypeScript。
 
 ## 截图
 
-> 上传页 — 传送门风格上传区 + 历史记录
+**上传页** — 传送门风格上传区 + 历史记录
 
-> 设置页 — Token 配置 + 仓库设置 + 连接测试
+![上传页](assets/images/upload.png)
+
+**设置页** — Token 配置 + 仓库设置 + 连接测试
+
+![设置页](assets/images/setting.png)
 
 ## 快速开始
 
