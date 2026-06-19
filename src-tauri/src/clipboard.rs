@@ -4,18 +4,15 @@ use tauri::{AppHandle, Emitter};
 
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
-/// Read image data from macOS clipboard via NSPasteboard
+/// Read image data from clipboard
 pub fn read_clipboard_image() -> Result<(Vec<u8>, String), String> {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
 
-        // Try reading image via osascript + NSPasteboard
-        // Write clipboard image to a temp file using Swift snippet
         let tmp_dir = std::env::temp_dir();
         let tmp_path = tmp_dir.join("imgbed_clipboard_tmp.png");
 
-        // Use swift to read NSPasteboard image
         let script = format!(
             r#"
             import AppKit
@@ -47,18 +44,41 @@ pub fn read_clipboard_image() -> Result<(Vec<u8>, String), String> {
             return Err("No image in clipboard".into());
         }
 
-        let data = std::fs::read(&tmp_path).map_err(|e| format!("Failed to read temp image: {}", e))?;
+        let data =
+            std::fs::read(&tmp_path).map_err(|e| format!("Failed to read temp image: {}", e))?;
         let _ = std::fs::remove_file(&tmp_path);
         Ok((data, ".png".into()))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err("Clipboard image reading is only supported on macOS".into())
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
+        let image = clipboard
+            .get_image()
+            .map_err(|e| format!("No image in clipboard: {}", e))?;
+        // Convert RGBA data to PNG using the image crate
+        let img = image::RgbaImage::from_raw(
+            image.width as u32,
+            image.height as u32,
+            image.bytes.into(),
+        )
+        .ok_or("Failed to create image from clipboard data")?;
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+        Ok((png_data, ".png".into()))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("Clipboard image reading is only supported on macOS and Windows".into())
     }
 }
 
-/// Check if clipboard currently has an image (lightweight check via changeCount)
+/// Check if clipboard currently has an image
 fn clipboard_has_image() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -85,9 +105,36 @@ fn clipboard_has_image() -> bool {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        arboard::Clipboard::new()
+            .and_then(|mut cb| cb.get_image().map(|_| true))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         false
+    }
+}
+
+/// Get clipboard change count (macOS only)
+#[cfg(target_os = "macos")]
+fn get_change_count() -> i64 {
+    let script = r#"
+    import AppKit
+    print(NSPasteboard.general.changeCount)
+    "#;
+    let output = std::process::Command::new("swift")
+        .arg("-e")
+        .arg(script)
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(-1),
+        Err(_) => -1,
     }
 }
 
@@ -99,36 +146,41 @@ pub fn watch_clipboard(app: AppHandle) -> Result<(), String> {
     WATCHING.store(true, Ordering::SeqCst);
 
     std::thread::spawn(move || {
-        let get_change_count = || -> i64 {
-            let script = r#"
-            import AppKit
-            print(NSPasteboard.general.changeCount)
-            "#;
-            let output = std::process::Command::new("swift")
-                .arg("-e")
-                .arg(script)
-                .output();
-            match output {
-                Ok(out) => String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse()
-                    .unwrap_or(-1),
-                Err(_) => -1,
-            }
-        };
+        let mut last_change_count: i64 = -1;
 
-        let mut last_change_count = get_change_count();
+        #[cfg(target_os = "macos")]
+        {
+            last_change_count = get_change_count();
+        }
 
         while WATCHING.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(500));
-            let current = get_change_count();
 
-            if current != last_change_count && current != -1 {
-                last_change_count = current;
+            #[cfg(target_os = "macos")]
+            {
+                let current = get_change_count();
+                if current != last_change_count && current != -1 {
+                    last_change_count = current;
+                    if clipboard_has_image() {
+                        log::info!("Clipboard image detected, uploading...");
+                        let _ = app.emit("clipboard-image-detected", ());
+                    }
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
                 if clipboard_has_image() {
                     log::info!("Clipboard image detected, uploading...");
                     let _ = app.emit("clipboard-image-detected", ());
+                    // On Windows, sleep longer to avoid re-triggering
+                    std::thread::sleep(Duration::from_secs(3));
                 }
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                break;
             }
         }
     });

@@ -2,7 +2,7 @@ import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { sendNotification } from "@tauri-apps/plugin-notification";
+import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { open } from "@tauri-apps/plugin-dialog";
 
 interface UploadResult {
@@ -35,6 +35,11 @@ const CONFIG_KEYS: (keyof Omit<UploadConfig, "token">)[] = [
 let watching = false;
 let uploading = false;
 let currentConfig: UploadConfig = { token: "", ...DEFAULTS };
+const uploadHistory: UploadResult[] = [];
+
+function esc(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
 const $ = <T extends HTMLElement>(sel: string): T =>
   document.querySelector<T>(sel)!;
@@ -56,7 +61,6 @@ async function loadConfig(): Promise<void> {
     } catch { /* keep default */ }
   }
 
-  // Fill UI
   const tokenInput = $("input#tokenInput") as HTMLInputElement;
   tokenInput.value = currentConfig.token ? maskToken(currentConfig.token) : "";
 
@@ -72,7 +76,6 @@ async function loadConfig(): Promise<void> {
 function readConfigFromUI(): UploadConfig {
   const tokenInput = $("input#tokenInput") as HTMLInputElement;
   const raw = tokenInput.value.trim();
-  // If masked, keep current; otherwise use raw
   const token = raw.includes("•") ? currentConfig.token : raw;
 
   return {
@@ -93,7 +96,6 @@ async function saveAllConfig(): Promise<void> {
       await invoke("set_config", { key, value: (cfg as Record<string, string>)[key] });
     }
     currentConfig = cfg;
-    // Re-mask token in UI
     ($("input#tokenInput") as HTMLInputElement).value = maskToken(cfg.token);
     updateTokenStatus("configured", "已保存");
     showToast("配置已保存", "success");
@@ -121,7 +123,6 @@ async function testConnection(): Promise<void> {
     });
     if (resp.ok) {
       const data = await resp.json();
-      // Token works, auto-save
       currentConfig = cfg;
       await invoke("set_config", { key: "github_token", value: cfg.token });
       for (const key of CONFIG_KEYS) {
@@ -171,19 +172,17 @@ async function uploadClipboardImage() {
   progress.style.display = "flex";
 
   try {
-    // Try clipboard first
-    const result = await invoke<UploadResult>("upload_clipboard_image", {
-      config: currentConfig,
-    });
-    history.unshift(result);
-    if (history.length > 20) history.pop();
-    renderHistory();
-    await writeText(result.cdn_url);
-    showToast("链接已复制到剪贴板", "success");
-    await sendNotification({ title: "ImgBed", body: "图片已上传，链接已复制" });
-  } catch {
-    // Clipboard has no image → open file picker
+    let result: UploadResult;
     try {
+      console.log("[imgbed] trying clipboard upload...");
+      result = await invoke<UploadResult>("upload_clipboard_image", {
+        config: currentConfig,
+      });
+      console.log("[imgbed] clipboard upload result:", JSON.stringify(result));
+    } catch (clipErr: unknown) {
+      const clipMsg = clipErr instanceof Error ? clipErr.message : String(clipErr);
+      console.log("[imgbed] clipboard empty:", clipMsg, "→ opening file picker");
+
       const selected = await open({
         multiple: true,
         filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] }],
@@ -193,21 +192,38 @@ async function uploadClipboardImage() {
         return;
       }
       const paths = Array.isArray(selected) ? selected : [selected];
+      let lastResult: UploadResult | null = null;
       for (const filePath of paths) {
-        const result = await invoke<UploadResult>("upload_file", {
+        console.log("[imgbed] uploading file:", filePath);
+        result = await invoke<UploadResult>("upload_file", {
           config: currentConfig,
           path: filePath,
         });
-        history.unshift(result);
-        if (history.length > 20) history.pop();
-        await writeText(result.cdn_url);
+        console.log("[imgbed] file upload result:", JSON.stringify(result));
+        uploadHistory.unshift(result);
+        if (uploadHistory.length > 20) uploadHistory.pop();
+        lastResult = result;
       }
       renderHistory();
-      showToast("链接已复制到剪贴板", "success");
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      showToast(`上传失败: ${msg}`, "error");
+      if (lastResult) {
+        showToast("上传成功！链接: " + lastResult.cdn_url, "success");
+        try { await writeText(lastResult.cdn_url); } catch (e: unknown) { showToast("复制失败: " + (e instanceof Error ? e.message : String(e)), "error"); }
+      }
+      return;
     }
+
+    // Clipboard upload succeeded
+    console.log("[imgbed] pushing to uploadHistory, current length:", uploadHistory.length);
+    uploadHistory.unshift(result);
+    if (uploadHistory.length > 20) uploadHistory.pop();
+    renderHistory();
+    showToast("上传成功！链接: " + result.cdn_url, "success");
+    try { await writeText(result.cdn_url); } catch (e: unknown) { showToast("复制失败: " + (e instanceof Error ? e.message : String(e)), "error"); }
+    try { sendNotification({ title: "ImgBed", body: "图片已上传" }); } catch (e: unknown) { console.log("[imgbed] notification skipped:", e); }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[imgbed] upload error:", e);
+    showToast(`上传失败: ${msg}`, "error");
   } finally {
     uploading = false;
     portal.style.display = "";
@@ -229,7 +245,7 @@ async function handleFileDrop(files: FileList) {
         config: currentConfig,
         path: (file as File & { path?: string }).path || file.name,
       });
-      history.unshift(result);
+      uploadHistory.unshift(result);
       renderHistory();
       await writeText(result.cdn_url);
       showToast("链接已复制到剪贴板", "success");
@@ -258,9 +274,9 @@ async function toggleWatch() {
 function renderHistory() {
   const list = $(".history-list");
   const count = $("span#historyCount");
-  count.textContent = String(history.length);
+  count.textContent = String(uploadHistory.length);
 
-  if (history.length === 0) {
+  if (uploadHistory.length === 0) {
     list.innerHTML = `
       <div class="history-empty">
         <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.3">
@@ -273,7 +289,7 @@ function renderHistory() {
     return;
   }
 
-  list.innerHTML = history
+  list.innerHTML = uploadHistory
     .map(
       (item, i) => `
     <div class="history-item" style="animation-delay: ${i * 0.04}s">
@@ -285,10 +301,10 @@ function renderHistory() {
         </svg>
       </div>
       <div class="history-item-info">
-        <div class="history-item-name">${item.filename}</div>
-        <div class="history-item-url">${item.cdn_url}</div>
+        <div class="history-item-name">${esc(item.filename)}</div>
+        <div class="history-item-url">${esc(item.cdn_url)}</div>
       </div>
-      <button class="history-copy-btn" data-url="${item.cdn_url}" title="复制链接">
+      <button class="history-copy-btn" data-url="${esc(item.cdn_url)}" title="复制链接">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
           <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
@@ -319,17 +335,18 @@ function switchTab(tab: string) {
   });
 }
 
-// ═══ Toast ═══
+// ═══ Toast — long display for errors ═══
 function showToast(msg: string, type: "success" | "error" | "info" = "info") {
   const container = $("div#toastContainer");
   const toast = document.createElement("div");
   toast.className = `toast ${type}`;
   toast.textContent = msg;
   container.appendChild(toast);
+  const duration = type === "error" ? 8000 : 3000;
   setTimeout(() => {
     toast.classList.add("exit");
     setTimeout(() => toast.remove(), 250);
-  }, 2200);
+  }, duration);
 }
 
 // ═══ Token Visibility ═══
@@ -378,7 +395,17 @@ function setupDragDrop() {
 
 // ═══ Init ═══
 async function init() {
+  console.log("[imgbed] app starting...");
   await loadConfig();
+  console.log("[imgbed] config loaded, token:", currentConfig.token ? "set" : "empty");
+
+  try {
+    let permitted = await isPermissionGranted();
+    if (!permitted) {
+      const permission = await requestPermission();
+      permitted = permission === "granted";
+    }
+  } catch { /* non-critical */ }
 
   await listen("clipboard-image-detected", async () => {
     if (uploading) return;
@@ -390,15 +417,13 @@ async function init() {
   });
 
   $(".watch-toggle").addEventListener("click", toggleWatch);
-
-  // Settings: test first, then auto-save on success
   $("button#testTokenBtn").addEventListener("click", testConnection);
-  // Save button for manual save (e.g. only changed repo config)
   $("button#saveTokenBtn").addEventListener("click", saveAllConfig);
 
   setupTokenVisibility();
   setupDragDrop();
   renderHistory();
+  console.log("[imgbed] ready");
 }
 
 document.addEventListener("DOMContentLoaded", init);
